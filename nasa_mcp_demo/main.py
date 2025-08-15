@@ -181,22 +181,31 @@ if not temp_config.debug:
 # Dependency to get NASA service
 async def get_nasa_service() -> NASAService:
     """Dependency to get NASA service instance."""
+    global nasa_service, app_config
+    
     if nasa_service is None:
-        raise HTTPException(
-            status_code=500,
-            detail="NASA service not initialized"
-        )
+        # Initialize service if not already done (for testing)
+        if app_config is None:
+            app_config = AppConfig()
+            setup_logging(app_config.logging)
+        
+        nasa_service = NASAService(app_config)
+        logger.info("NASA service initialized on-demand")
+    
     return nasa_service
 
 
 # Dependency to get app config
 async def get_app_config() -> AppConfig:
     """Dependency to get app configuration."""
+    global app_config
+    
     if app_config is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Application configuration not loaded"
-        )
+        # Initialize config if not already done (for testing)
+        app_config = AppConfig()
+        setup_logging(app_config.logging)
+        logger.info("App config initialized on-demand")
+    
     return app_config
 
 
@@ -281,49 +290,17 @@ async def general_exception_handler(request: Request, exc: Exception):
     )
 
 
-# Middleware configuration
-async def add_request_id_middleware(request: Request, call_next):
-    """Add request ID to all requests for tracking."""
-    import uuid
-    request_id = str(uuid.uuid4())
-    request.state.request_id = request_id
-    
-    # Add request ID to structured logging context
-    with structlog.contextvars.bound_contextvars(request_id=request_id):
-        response = await call_next(request)
-        response.headers["X-Request-ID"] = request_id
-        return response
+# Import middleware
+from .middleware import (
+    RequestLoggingMiddleware,
+    PerformanceMonitoringMiddleware,
+    HealthCheckMiddleware
+)
 
-
-async def logging_middleware(request: Request, call_next):
-    """Log all requests and responses."""
-    start_time = datetime.now()
-    
-    # Log request
-    logger.info("Request started",
-                method=request.method,
-                path=request.url.path,
-                query_params=str(request.query_params),
-                client_ip=request.client.host if request.client else None)
-    
-    response = await call_next(request)
-    
-    # Calculate duration
-    duration = (datetime.now() - start_time).total_seconds()
-    
-    # Log response
-    logger.info("Request completed",
-                method=request.method,
-                path=request.url.path,
-                status_code=response.status_code,
-                duration_seconds=duration)
-    
-    return response
-
-
-# Add HTTP middleware
-app.middleware("http")(add_request_id_middleware)
-app.middleware("http")(logging_middleware)
+# Add comprehensive middleware
+app.add_middleware(RequestLoggingMiddleware)
+app.add_middleware(PerformanceMonitoringMiddleware)
+app.add_middleware(HealthCheckMiddleware)
 
 
 
@@ -622,6 +599,102 @@ async def get_available_rovers():
             "NAVCAM": "Navigation Camera",
             "PANCAM": "Panoramic Camera"
         }
+    }
+
+
+@app.get("/metrics",
+         summary="Performance Metrics",
+         description="Get application performance metrics and monitoring data")
+async def get_performance_metrics(
+    service: NASAService = Depends(get_nasa_service),
+    config: AppConfig = Depends(get_app_config)
+):
+    """
+    Get comprehensive performance metrics and monitoring data.
+    
+    Returns:
+    - NASA API client performance statistics
+    - Request/response metrics
+    - Error tracking information
+    - System health indicators
+    """
+    try:
+        # Get NASA client performance stats
+        nasa_stats = await service.get_performance_stats()
+        
+        # Get middleware metrics (if available)
+        middleware_metrics = {}
+        for middleware in app.user_middleware:
+            if hasattr(middleware.cls, 'get_metrics'):
+                try:
+                    middleware_metrics[middleware.cls.__name__] = middleware.cls.get_metrics()
+                except Exception:
+                    pass
+        
+        # Get logging configuration
+        from .logging_config import get_logging_config
+        logging_config = get_logging_config()
+        
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "nasa_api_stats": nasa_stats,
+            "middleware_metrics": middleware_metrics,
+            "logging_config": {
+                "level": logging_config.get("log_level", "INFO"),
+                "request_logging_enabled": logging_config.get("enable_request_logging", True),
+                "nasa_api_logging_enabled": logging_config.get("enable_nasa_api_logging", True)
+            },
+            "application_config": {
+                "debug_mode": config.debug,
+                "nasa_api_key_type": "DEMO_KEY" if config.is_demo_mode() else "CUSTOM",
+                "rate_limit_per_hour": config.nasa.rate_limit_per_hour,
+                "timeout_seconds": config.nasa.timeout,
+                "max_retries": config.nasa.max_retries
+            }
+        }
+    except Exception as e:
+        logger.error("Failed to get performance metrics", error=str(e))
+        return {
+            "error": "Failed to retrieve metrics",
+            "timestamp": datetime.now().isoformat()
+        }
+
+
+@app.get("/debug/logs",
+         summary="Debug Logging Information",
+         description="Get current logging configuration and recent log statistics")
+async def get_debug_logs(config: AppConfig = Depends(get_app_config)):
+    """
+    Get debugging information about logging configuration.
+    
+    This endpoint is useful for troubleshooting logging issues
+    and understanding the current logging setup.
+    """
+    if not config.debug:
+        raise HTTPException(
+            status_code=403,
+            detail="Debug endpoints are only available in debug mode"
+        )
+    
+    from .logging_config import get_logging_config
+    logging_config = get_logging_config()
+    
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "logging_configuration": {
+            "level": config.logging.level,
+            "format": config.logging.format,
+            "request_logging": config.logging.enable_request_logging,
+            "nasa_api_logging": config.logging.enable_nasa_api_logging,
+            "performance_logging": config.logging.enable_performance_logging,
+            "error_tracking": config.logging.enable_error_tracking,
+            "performance_threshold_ms": config.logging.performance_threshold_ms,
+            "slow_operation_threshold_ms": config.logging.slow_operation_threshold_ms
+        },
+        "runtime_config": logging_config,
+        "debug_mode": config.debug,
+        "log_levels": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        "log_formats": ["json", "text"]
     }
 
 

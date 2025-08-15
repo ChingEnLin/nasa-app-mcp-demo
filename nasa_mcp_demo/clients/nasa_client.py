@@ -8,13 +8,14 @@ and comprehensive error handling.
 """
 
 import asyncio
-import logging
+import time
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Any
 from urllib.parse import urljoin
 
 import httpx
 from httpx import AsyncClient, Response, TimeoutException, HTTPStatusError
+import structlog
 
 from ..models.config import NASAConfig
 from ..models.errors import (
@@ -25,9 +26,10 @@ from ..models.errors import (
     NASAAPITimeout,
 )
 from ..models.nasa_responses import APODResponse, MarsRoverResponse, NEOResponse
+from ..logging_config import NASAAPILogger, PerformanceMonitor, ErrorTracker
 
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class RateLimiter:
@@ -82,6 +84,7 @@ class NASAClient:
     - Comprehensive error handling
     - Request/response logging
     - Timeout handling
+    - Performance monitoring
     """
     
     def __init__(self, config: NASAConfig):
@@ -94,6 +97,11 @@ class NASAClient:
         self.config = config
         self.base_url = str(config.base_url)
         self.api_key = config.api_key
+        
+        # Initialize logging and monitoring utilities
+        self.api_logger = NASAAPILogger(logger)
+        self.performance_monitor = PerformanceMonitor(logger)
+        self.error_tracker = ErrorTracker(logger)
         
         # Initialize rate limiter
         self.rate_limiter = RateLimiter(
@@ -112,6 +120,16 @@ class NASAClient:
         }
         
         self._client: Optional[AsyncClient] = None
+        
+        # Performance tracking
+        self.request_stats = {
+            "total_requests": 0,
+            "successful_requests": 0,
+            "failed_requests": 0,
+            "cache_hits": 0,
+            "rate_limit_hits": 0,
+            "total_response_time_ms": 0.0
+        }
     
     async def __aenter__(self):
         """Async context manager entry."""
@@ -163,6 +181,15 @@ class NASAClient:
         
         url = urljoin(self.base_url, endpoint)
         
+        # Start performance monitoring
+        start_time = time.time()
+        
+        # Log request start
+        self.api_logger.log_request(endpoint, params)
+        
+        # Update request statistics
+        self.request_stats["total_requests"] += 1
+        
         # Apply rate limiting
         await self.rate_limiter.acquire()
         
@@ -170,19 +197,64 @@ class NASAClient:
         
         for attempt in range(max_retries + 1):
             try:
-                logger.debug(f"Making request to {url} (attempt {attempt + 1}/{max_retries + 1})")
+                # Log retry attempt if not first attempt
+                if attempt > 0:
+                    logger.info(
+                        "Retrying NASA API request",
+                        endpoint=endpoint,
+                        attempt=attempt + 1,
+                        max_retries=max_retries + 1
+                    )
                 
                 response = await client.get(url, params=request_params)
+                
+                # Calculate response time
+                response_time_ms = (time.time() - start_time) * 1000
+                
+                # Calculate response size safely
+                response_size = 0
+                try:
+                    if hasattr(response, 'content') and response.content:
+                        response_size = len(response.content)
+                except (TypeError, AttributeError):
+                    # Handle mock objects or other issues
+                    response_size = 0
+                
+                # Log response
+                self.api_logger.log_response(
+                    endpoint,
+                    response.status_code,
+                    response_size,
+                    response_time_ms
+                )
                 
                 # Handle different HTTP status codes
                 if response.status_code == 200:
                     data = response.json()
-                    logger.debug(f"Successful response from {url}")
+                    
+                    # Update success statistics
+                    self.request_stats["successful_requests"] += 1
+                    self.request_stats["total_response_time_ms"] += response_time_ms
+                    
+                    # Log successful completion
+                    logger.info(
+                        "NASA API request successful",
+                        endpoint=endpoint,
+                        response_time_ms=round(response_time_ms, 2),
+                        response_size_bytes=response_size,
+                        attempt=attempt + 1
+                    )
+                    
                     return data
                 
                 elif response.status_code == 429:
                     # Rate limited
                     retry_after = int(response.headers.get("Retry-After", 60))
+                    self.request_stats["rate_limit_hits"] += 1
+                    
+                    # Log rate limiting
+                    self.api_logger.log_rate_limit(endpoint, retry_after)
+                    
                     raise NASAAPIRateLimited(
                         message=f"Rate limit exceeded. Retry after {retry_after} seconds",
                         status_code=response.status_code,
@@ -193,8 +265,17 @@ class NASAClient:
                 elif response.status_code == 400:
                     # Bad request
                     error_data = self._safe_json_parse(response)
+                    error_message = error_data.get('error', {}).get('message', 'Unknown error')
+                    
+                    # Log validation error
+                    self.api_logger.log_error(
+                        endpoint,
+                        NASAAPIInvalidRequest(error_message),
+                        retry_attempt=attempt
+                    )
+                    
                     raise NASAAPIInvalidRequest(
-                        message=f"Invalid request parameters: {error_data.get('error', {}).get('message', 'Unknown error')}",
+                        message=f"Invalid request parameters: {error_message}",
                         status_code=response.status_code,
                         response_data=error_data
                     )
@@ -202,8 +283,17 @@ class NASAClient:
                 elif response.status_code == 403:
                     # Forbidden (usually API key issues)
                     error_data = self._safe_json_parse(response)
+                    error_message = error_data.get('error', {}).get('message', 'Forbidden')
+                    
+                    # Log authentication error
+                    self.api_logger.log_error(
+                        endpoint,
+                        NASAAPIInvalidRequest(error_message),
+                        retry_attempt=attempt
+                    )
+                    
                     raise NASAAPIInvalidRequest(
-                        message=f"API key invalid or insufficient permissions: {error_data.get('error', {}).get('message', 'Forbidden')}",
+                        message=f"API key invalid or insufficient permissions: {error_message}",
                         status_code=response.status_code,
                         response_data=error_data
                     )
@@ -211,14 +301,32 @@ class NASAClient:
                 elif response.status_code >= 500:
                     # Server error - retry
                     error_data = self._safe_json_parse(response)
+                    error_message = f"NASA API server error: {response.status_code}"
+                    
                     if attempt < max_retries:
                         wait_time = self._calculate_backoff_time(attempt)
-                        logger.warning(f"Server error {response.status_code}, retrying in {wait_time}s")
+                        
+                        # Log retry attempt
+                        logger.warning(
+                            "NASA API server error, retrying",
+                            endpoint=endpoint,
+                            status_code=response.status_code,
+                            attempt=attempt + 1,
+                            wait_time_seconds=wait_time
+                        )
+                        
                         await asyncio.sleep(wait_time)
                         continue
                     else:
+                        # Log final failure
+                        self.api_logger.log_error(
+                            endpoint,
+                            NASAAPIUnavailable(error_message),
+                            retry_attempt=attempt
+                        )
+                        
                         raise NASAAPIUnavailable(
-                            message=f"NASA API server error: {response.status_code}",
+                            message=error_message,
                             status_code=response.status_code,
                             response_data=error_data
                         )
@@ -226,19 +334,44 @@ class NASAClient:
                 else:
                     # Other HTTP errors
                     error_data = self._safe_json_parse(response)
+                    error_message = f"Unexpected HTTP status: {response.status_code}"
+                    
+                    # Log unexpected error
+                    self.api_logger.log_error(
+                        endpoint,
+                        NASAAPIError(error_message),
+                        retry_attempt=attempt
+                    )
+                    
                     raise NASAAPIError(
-                        message=f"Unexpected HTTP status: {response.status_code}",
+                        message=error_message,
                         status_code=response.status_code,
                         response_data=error_data
                     )
             
             except TimeoutException as e:
+                # Log timeout error
+                self.api_logger.log_error(
+                    endpoint,
+                    NASAAPITimeout(f"Request timeout after {self.config.timeout}s"),
+                    retry_attempt=attempt
+                )
+                
                 if attempt < max_retries:
                     wait_time = self._calculate_backoff_time(attempt)
-                    logger.warning(f"Request timeout, retrying in {wait_time}s")
+                    logger.warning(
+                        "NASA API request timeout, retrying",
+                        endpoint=endpoint,
+                        timeout_seconds=self.config.timeout,
+                        attempt=attempt + 1,
+                        wait_time_seconds=wait_time
+                    )
                     await asyncio.sleep(wait_time)
                     continue
                 else:
+                    # Update failure statistics
+                    self.request_stats["failed_requests"] += 1
+                    
                     raise NASAAPITimeout(
                         message=f"Request timed out after {self.config.timeout} seconds",
                         timeout_duration=self.config.timeout
@@ -247,6 +380,15 @@ class NASAClient:
             except HTTPStatusError as e:
                 # This shouldn't happen as we handle status codes above,
                 # but included for completeness
+                self.api_logger.log_error(
+                    endpoint,
+                    NASAAPIError(f"HTTP error: {e}"),
+                    retry_attempt=attempt
+                )
+                
+                # Update failure statistics
+                self.request_stats["failed_requests"] += 1
+                
                 raise NASAAPIError(
                     message=f"HTTP error: {e}",
                     status_code=e.response.status_code if e.response else None
@@ -254,26 +396,100 @@ class NASAClient:
             
             except NASAAPIError:
                 # Re-raise NASA API errors without retrying
+                # Update failure statistics
+                self.request_stats["failed_requests"] += 1
                 raise
             
             except Exception as e:
+                # Log unexpected error
+                self.api_logger.log_error(
+                    endpoint,
+                    e,
+                    retry_attempt=attempt
+                )
+                
                 if attempt < max_retries:
                     wait_time = self._calculate_backoff_time(attempt)
-                    logger.warning(f"Unexpected error: {e}, retrying in {wait_time}s")
+                    logger.warning(
+                        "Unexpected error during NASA API request, retrying",
+                        endpoint=endpoint,
+                        error=str(e),
+                        error_type=type(e).__name__,
+                        attempt=attempt + 1,
+                        wait_time_seconds=wait_time
+                    )
                     await asyncio.sleep(wait_time)
                     continue
                 else:
+                    # Update failure statistics
+                    self.request_stats["failed_requests"] += 1
+                    
+                    # Track error for debugging
+                    self.error_tracker.track_error(
+                        e,
+                        context="nasa_api_request",
+                        endpoint=endpoint,
+                        attempt=attempt + 1
+                    )
+                    
                     raise NASAAPIError(
                         message=f"Unexpected error during API request: {e}"
                     ) from e
         
         # This should never be reached, but included for type safety
+        # Update failure statistics
+        self.request_stats["failed_requests"] += 1
         raise NASAAPIError("Maximum retries exceeded")
     
     def _calculate_backoff_time(self, attempt: int) -> float:
         """Calculate exponential backoff time."""
         base_delay = self.config.retry_backoff_factor
         return min(base_delay * (2 ** attempt), 60.0)  # Cap at 60 seconds
+    
+    def _safe_json_parse(self, response: Response) -> Dict[str, Any]:
+        """Safely parse JSON response, returning empty dict on failure."""
+        try:
+            return response.json()
+        except Exception:
+            return {"error": {"message": "Failed to parse response JSON"}}
+    
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Get current performance statistics."""
+        stats = self.request_stats.copy()
+        
+        # Calculate derived metrics
+        if stats["total_requests"] > 0:
+            stats["success_rate"] = (
+                stats["successful_requests"] / stats["total_requests"] * 100
+            )
+            stats["failure_rate"] = (
+                stats["failed_requests"] / stats["total_requests"] * 100
+            )
+        else:
+            stats["success_rate"] = 0.0
+            stats["failure_rate"] = 0.0
+        
+        if stats["successful_requests"] > 0:
+            stats["avg_response_time_ms"] = (
+                stats["total_response_time_ms"] / stats["successful_requests"]
+            )
+        else:
+            stats["avg_response_time_ms"] = 0.0
+        
+        return stats
+    
+    def reset_performance_stats(self) -> None:
+        """Reset performance statistics."""
+        self.request_stats = {
+            "total_requests": 0,
+            "successful_requests": 0,
+            "failed_requests": 0,
+            "cache_hits": 0,
+            "rate_limit_hits": 0,
+            "total_response_time_ms": 0.0
+        }
+        
+        logger.info("NASA API client performance statistics reset")
     
     def _safe_json_parse(self, response: Response) -> Dict[str, Any]:
         """Safely parse JSON response, returning empty dict on failure."""

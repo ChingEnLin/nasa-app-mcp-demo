@@ -5,7 +5,7 @@ Educational demonstration of integrating MCP (Model Context Protocol) capabiliti
 ## Project Structure
 
 ```
-nasa-mcp-demo/
+nasa-app-mcp-demo/
 ├── nasa_mcp_demo/           # Main application package
 │   ├── __init__.py
 │   ├── config.py            # Configuration management

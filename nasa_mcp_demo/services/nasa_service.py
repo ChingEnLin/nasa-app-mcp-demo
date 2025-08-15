@@ -6,20 +6,22 @@ including data transformation, enrichment, input validation, and caching.
 """
 
 import asyncio
-import logging
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Any
 from functools import lru_cache
 import hashlib
 import json
 
+import structlog
+
 from ..clients.nasa_client import NASAClient
 from ..models.config import AppConfig, CacheConfig
 from ..models.errors import NASAAPIError, NASAAPIInvalidRequest
 from ..models.nasa_responses import APODResponse, MarsRoverResponse, NEOResponse
+from ..logging_config import PerformanceMonitor, ErrorTracker
 
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class CacheEntry:
@@ -752,3 +754,115 @@ class NASAService:
             }
         
         return health_status
+    
+    async def get_performance_stats(self) -> Dict[str, Any]:
+        """
+        Get comprehensive performance statistics.
+        
+        Returns:
+            Performance statistics from NASA client and service layer
+        """
+        stats = {
+            "timestamp": datetime.now().isoformat(),
+            "service_stats": {
+                "cache_enabled": self.cache is not None,
+                "cache_config": {
+                    "apod_ttl": self.cache_config.apod_cache_ttl,
+                    "mars_photos_ttl": self.cache_config.mars_photos_cache_ttl,
+                    "neo_ttl": self.cache_config.neo_cache_ttl,
+                    "max_size": self.cache_config.max_cache_size
+                } if self.cache else None
+            }
+        }
+        
+        # Add cache statistics if enabled
+        if self.cache:
+            cache_stats = {
+                "current_size": len(self.cache._cache),
+                "max_size": self.cache.max_size,
+                "hit_rate": 0.0,  # Would need to track hits/misses to calculate
+                "expired_entries": 0
+            }
+            
+            # Count expired entries
+            expired_count = 0
+            for entry in self.cache._cache.values():
+                if entry.is_expired():
+                    expired_count += 1
+            cache_stats["expired_entries"] = expired_count
+            
+            stats["service_stats"]["cache_stats"] = cache_stats
+        
+        # Get NASA client performance stats if available
+        if self.nasa_client:
+            try:
+                nasa_stats = self.nasa_client.get_performance_stats()
+                stats["nasa_client_stats"] = nasa_stats
+            except Exception as e:
+                logger.warning("Failed to get NASA client stats", error=str(e))
+                stats["nasa_client_stats"] = {"error": str(e)}
+        
+        return stats
+    
+    def clear_cache(self) -> Dict[str, Any]:
+        """
+        Clear the service cache.
+        
+        Returns:
+            Cache clearing results
+        """
+        if not self.cache:
+            return {
+                "status": "no_cache",
+                "message": "Caching is not enabled"
+            }
+        
+        old_size = len(self.cache._cache)
+        self.cache._cache.clear()
+        self.cache._access_order.clear()
+        
+        logger.info("Service cache cleared", old_size=old_size)
+        
+        return {
+            "status": "cleared",
+            "entries_removed": old_size,
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    def get_cache_info(self) -> Dict[str, Any]:
+        """
+        Get detailed cache information.
+        
+        Returns:
+            Detailed cache statistics and configuration
+        """
+        if not self.cache:
+            return {
+                "enabled": False,
+                "message": "Caching is not enabled"
+            }
+        
+        cache_info = {
+            "enabled": True,
+            "current_size": len(self.cache._cache),
+            "max_size": self.cache.max_size,
+            "configuration": {
+                "apod_ttl_seconds": self.cache_config.apod_cache_ttl,
+                "mars_photos_ttl_seconds": self.cache_config.mars_photos_cache_ttl,
+                "neo_ttl_seconds": self.cache_config.neo_cache_ttl,
+                "max_cache_size": self.cache_config.max_cache_size
+            },
+            "entries": []
+        }
+        
+        # Add information about cached entries
+        for key, entry in self.cache._cache.items():
+            cache_info["entries"].append({
+                "key": key,
+                "created_at": entry.created_at.isoformat(),
+                "ttl_seconds": entry.ttl,
+                "is_expired": entry.is_expired(),
+                "age_seconds": int((datetime.now() - entry.created_at).total_seconds())
+            })
+        
+        return cache_info

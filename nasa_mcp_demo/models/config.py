@@ -80,6 +80,32 @@ class LoggingConfig(BaseModel):
         default=True,
         description="Enable NASA API call logging"
     )
+    enable_performance_logging: bool = Field(
+        default=True,
+        description="Enable performance monitoring and logging"
+    )
+    enable_error_tracking: bool = Field(
+        default=True,
+        description="Enable detailed error tracking and debugging"
+    )
+    log_request_body: bool = Field(
+        default=False,
+        description="Log request body content (may contain sensitive data)"
+    )
+    log_response_body: bool = Field(
+        default=False,
+        description="Log response body content (can be large)"
+    )
+    performance_threshold_ms: int = Field(
+        default=1000,
+        description="Performance warning threshold in milliseconds",
+        ge=100
+    )
+    slow_operation_threshold_ms: int = Field(
+        default=5000,
+        description="Slow operation warning threshold in milliseconds",
+        ge=1000
+    )
     
     @field_validator('level')
     @classmethod
