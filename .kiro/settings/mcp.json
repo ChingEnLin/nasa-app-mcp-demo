@@ -1,9 +1,9 @@
 {
     "mcpServers": {
-        "nasa-mcp-demo": {
-            "command": "python3",
+        "nasa-mcp-server": {
+            "command": "/Users/celin/Documents/Document-MacBook-Pro/Side Project/nasa-app-mcp-demo/venv/bin/python",
             "args": [
-                "/Users/celin/Documents/Document-MacBook-Pro/Side Project/nasa-app-mcp-demo/mcp_bridge_full.py"
+                "/Users/celin/Documents/Document-MacBook-Pro/Side Project/nasa-app-mcp-demo/mcp_bridge.py"
             ],
             "env": {},
             "disabled": false,
