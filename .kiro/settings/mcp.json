@@ -1,0 +1,17 @@
+{
+    "mcpServers": {
+        "nasa-mcp-demo": {
+            "command": "python3",
+            "args": [
+                "/Users/celin/Documents/Document-MacBook-Pro/Side Project/nasa-app-mcp-demo/mcp_bridge_full.py"
+            ],
+            "env": {},
+            "disabled": false,
+            "autoApprove": [
+                "get_astronomy_picture",
+                "search_mars_rover_photos",
+                "find_near_earth_objects"
+            ]
+        }
+    }
+}

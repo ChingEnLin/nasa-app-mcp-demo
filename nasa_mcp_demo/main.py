@@ -22,6 +22,7 @@ from .models.config import AppConfig
 from .models.errors import NASAAPIError, NASAAPIInvalidRequest, NASAAPIUnavailable, NASAAPIRateLimited
 from .services.nasa_service import NASAService
 from .logging_config import setup_logging
+from .mcp_server import create_mcp_server, NASAMCPServer
 
 
 # Configure structured logging
@@ -30,6 +31,7 @@ logger = structlog.get_logger(__name__)
 # Global app configuration
 app_config: Optional[AppConfig] = None
 nasa_service: Optional[NASAService] = None
+mcp_server: Optional[NASAMCPServer] = None
 
 
 # Response models for API documentation
@@ -97,7 +99,7 @@ class NEOResponseModel(BaseModel):
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
     # Startup
-    global app_config, nasa_service
+    global app_config, nasa_service, mcp_server
     
     logger.info("Starting NASA MCP Demo application")
     
@@ -110,10 +112,26 @@ async def lifespan(app: FastAPI):
     # Initialize NASA service
     nasa_service = NASAService(app_config)
     
+    # Initialize MCP server if enabled
+    if app_config.enable_mcp:
+        try:
+            mcp_server = create_mcp_server(app, app_config, nasa_service)
+            logger.info("MCP server integration enabled", 
+                       server_name=app_config.mcp_server_name)
+        except Exception as e:
+            logger.error("Failed to initialize MCP server", error=str(e))
+            # Continue without MCP if it fails
+            mcp_server = None
+    else:
+        logger.info("MCP server integration disabled")
+        mcp_server = None
+    
     logger.info("Application startup complete", 
                 app_name=app_config.app_name,
                 version=app_config.app_version,
-                debug=app_config.debug)
+                debug=app_config.debug,
+                mcp_enabled=app_config.enable_mcp,
+                mcp_initialized=mcp_server is not None if app_config.enable_mcp else False)
     
     yield
     
@@ -207,6 +225,13 @@ async def get_app_config() -> AppConfig:
         logger.info("App config initialized on-demand")
     
     return app_config
+
+
+# Dependency to get MCP server
+async def get_mcp_server() -> Optional[NASAMCPServer]:
+    """Dependency to get MCP server instance."""
+    global mcp_server
+    return mcp_server
 
 
 # Custom exception handlers
@@ -311,25 +336,45 @@ app.add_middleware(HealthCheckMiddleware)
 @app.get("/", 
          summary="API Root",
          description="Get basic API information and available endpoints")
-async def root():
+async def root(
+    config: AppConfig = Depends(get_app_config),
+    mcp: Optional[NASAMCPServer] = Depends(get_mcp_server)
+):
     """Root endpoint with API information."""
-    return {
+    endpoints = {
+        "apod": "/apod - Astronomy Picture of the Day",
+        "mars_photos": "/mars-photos/{rover} - Mars rover photos",
+        "neo": "/neo - Near Earth Objects",
+        "health": "/health - Health check",
+        "docs": "/docs - API documentation"
+    }
+    
+    # Add MCP status endpoint if MCP is enabled
+    if config.enable_mcp:
+        endpoints["mcp_status"] = "/mcp/status - MCP server status"
+    
+    response = {
         "name": "NASA Data API",
         "version": "1.0.0",
         "description": "Educational demo for NASA API integration with FastAPI",
-        "endpoints": {
-            "apod": "/apod - Astronomy Picture of the Day",
-            "mars_photos": "/mars-photos/{rover} - Mars rover photos",
-            "neo": "/neo - Near Earth Objects",
-            "health": "/health - Health check",
-            "docs": "/docs - API documentation"
-        },
+        "endpoints": endpoints,
         "nasa_apis": [
             "Astronomy Picture of the Day (APOD)",
             "Mars Rover Photos",
             "Near Earth Objects (NEO)"
         ]
     }
+    
+    # Add MCP information if enabled
+    if config.enable_mcp:
+        response["mcp_integration"] = {
+            "enabled": True,
+            "server_name": config.mcp_server_name,
+            "initialized": mcp is not None,
+            "status_endpoint": "/mcp/status"
+        }
+    
+    return response
 
 
 @app.get("/health",
@@ -658,6 +703,51 @@ async def get_performance_metrics(
             "error": "Failed to retrieve metrics",
             "timestamp": datetime.now().isoformat()
         }
+
+
+@app.get("/mcp/status",
+         summary="MCP Server Status",
+         description="Get MCP server status and configuration information")
+async def get_mcp_status(
+    config: AppConfig = Depends(get_app_config),
+    mcp: Optional[NASAMCPServer] = Depends(get_mcp_server)
+):
+    """
+    Get MCP server status and configuration.
+    
+    Returns information about:
+    - MCP server enablement status
+    - Server configuration
+    - Available tools (when implemented)
+    - Protocol information
+    """
+    if mcp is None:
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "mcp_enabled": config.enable_mcp,
+            "mcp_initialized": False,
+            "server_info": {
+                "enabled": False,
+                "reason": "MCP server not initialized" if config.enable_mcp else "MCP disabled in configuration"
+            },
+            "configuration": {
+                "enable_mcp": config.enable_mcp,
+                "mcp_server_name": config.mcp_server_name
+            }
+        }
+    
+    server_info = mcp.get_server_info()
+    
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "mcp_enabled": config.enable_mcp,
+        "mcp_initialized": True,
+        "server_info": server_info,
+        "configuration": {
+            "enable_mcp": config.enable_mcp,
+            "mcp_server_name": config.mcp_server_name
+        }
+    }
 
 
 @app.get("/debug/logs",

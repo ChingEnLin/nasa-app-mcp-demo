@@ -29,12 +29,10 @@ dependencies = [
     "pydantic-settings>=2.0.0",
     "python-dotenv>=1.0.0",
     "structlog>=23.2.0",
+    "fastapi-mcp>=0.4.0",
 ]
 
 [project.optional-dependencies]
-mcp = [
-    "fastapi-mcp>=0.1.0",
-]
 dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.21.0",
