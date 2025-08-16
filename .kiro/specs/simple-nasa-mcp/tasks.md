@@ -6,7 +6,7 @@
   - Create clean project root with minimal structure
   - _Requirements: 1.1_
 
-- [ ] 2. Create simple main.py with FastAPI and NASA endpoints
+- [x] 2. Create simple main.py with FastAPI and NASA endpoints
   - Write single main.py file with FastAPI application
   - Add three NASA API endpoints: /apod, /mars-photos, /neo
   - Include basic httpx client for NASA API calls
