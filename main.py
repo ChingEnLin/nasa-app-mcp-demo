@@ -1,17 +1,17 @@
 import os
 import httpx
-from datetime import datetime
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from fastapi_mcp import FastApiMCP
 
 # Load environment variables
 load_dotenv()
 
 app = FastAPI(
     title="Simple NASA MCP Server",
-    description="A simple FastAPI server providing NASA data through REST endpoints",
+    description="A simple FastAPI server providing NASA data through REST endpoints and MCP",
     version="1.0.0"
 )
 
@@ -53,6 +53,8 @@ class NEOResponse(BaseModel):
 class NEOFeedResponse(BaseModel):
     element_count: int
     near_earth_objects: Dict[str, List[NEOResponse]]
+
+
 
 @app.get("/health")
 async def health_check():
@@ -139,6 +141,14 @@ async def get_near_earth_objects(
         raise HTTPException(status_code=503, detail=f"Failed to connect to NASA API: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+# Initialize and mount MCP server
+mcp = FastApiMCP(
+    app,
+    name="nasa-mcp-server",
+    description="NASA data access through MCP protocol"
+)
+mcp.mount_sse(app, mount_path="/mcp")
 
 @app.on_event("shutdown")
 async def shutdown_event():
